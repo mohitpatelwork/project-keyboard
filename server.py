@@ -1,108 +1,117 @@
-# main.py
-# This is a simple Flask server to act as the middleman for the remote keyboard.
-# To run this:
-# 1. Install Flask and Flask-CORS: pip install Flask Flask-CORS
-# 2. Run the server: python main.py
-# On an AWS EC2 instance, you would run this using a production server like Gunicorn.
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import asyncio
+import websockets
+import json
 import random
 import string
 
-# Initialize the Flask app
-app = Flask(__name__)
-# Enable Cross-Origin Resource Sharing (CORS) to allow our mobile app
-# and desktop client to communicate with the server.
-CORS(app)
+# --- Server State ---
+# This dictionary will store the active sessions.
+# Key: session_id (e.g., "123-456")
+# Value: A dictionary {'host': host_websocket, 'client': client_websocket}
+SESSIONS = {}
 
-# This dictionary will act as our simple in-memory "database".
-# It will store the connection code and the text to be typed.
-# Format: { 'code': 'text_to_type' }
-# Example: { '123456': 'Hello from my phone!' }
-connections = {}
-
-def generate_code(length=6):
-    """Generates a random alphanumeric code."""
+def generate_session_id():
+    """Generates a unique 6-character session ID."""
     while True:
-        # Generate a new code
-        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-        # Ensure the code is not already in use
-        if code not in connections:
-            return code
+        session_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        if session_id not in SESSIONS:
+            return session_id
 
-@app.route('/')
-def index():
-    """A simple index route to confirm the server is running."""
-    return "Remote Keyboard Server is running!"
+async def relay_messages(session_id, sender_ws, receiver_ws):
+    """Relays messages from a sender websocket to a receiver websocket."""
+    try:
+        async for message in sender_ws:
+            if receiver_ws and receiver_ws.open:
+                await receiver_ws.send(message)
+    except websockets.exceptions.ConnectionClosed:
+        print(f"Connection closed for a participant in session {session_id}.")
+    finally:
+        # When one participant disconnects, we can notify the other.
+        if receiver_ws and receiver_ws.open:
+            await receiver_ws.send(json.dumps({'type': 'partner_disconnected'}))
+        print(f"Relay stopped for session {session_id}.")
 
-@app.route('/get-code', methods=['GET'])
-def get_code():
+
+async def handler(websocket, path):
     """
-    Generates a unique code for the PC client to use.
-    The PC app will call this endpoint first.
+    Handles incoming websocket connections and routes them based on the initial message.
     """
-    code = generate_code()
-    # Store the new code with an empty text value
-    connections[code] = ""
-    print(f"New connection code generated: {code}. Current connections: {connections}")
-    return jsonify({'code': code})
+    print(f"New connection from {websocket.remote_address}")
+    try:
+        # The first message determines the role of the connection (host or client)
+        initial_message = await websocket.recv()
+        data = json.loads(initial_message)
+        role = data.get('role')
 
-@app.route('/send-text', methods=['POST'])
-def send_text():
-    """
-    Receives text from the mobile app and associates it with a code.
-    The mobile app will call this endpoint.
-    """
-    data = request.get_json()
-    if not data or 'code' not in data or 'text' not in data:
-        return jsonify({'status': 'error', 'message': 'Invalid data. Required: code, text'}), 400
+        if role == 'host':
+            session_id = generate_session_id()
+            SESSIONS[session_id] = {'host': websocket, 'client': None}
+            print(f"Host registered for new session: {session_id}")
+            
+            # Send the session ID back to the host
+            await websocket.send(json.dumps({'type': 'session_created', 'session_id': session_id}))
 
-    code = data['code']
-    text = data['text']
+            # Wait for the client to connect
+            while SESSIONS[session_id]['client'] is None:
+                await asyncio.sleep(1) # Check every second
+            
+            client_ws = SESSIONS[session_id]['client']
+            print(f"Client connected to session {session_id}. Starting relay.")
+            await websocket.send(json.dumps({'type': 'client_connected'}))
 
-    if code not in connections:
-        return jsonify({'status': 'error', 'message': 'Invalid connection code'}), 404
+            # Start relaying messages from host to client
+            await relay_messages(session_id, websocket, client_ws)
 
-    # Store the text for the given code
-    connections[code] = text
-    print(f"Received text for code {code}: '{text}'. Current connections: {connections}")
-    return jsonify({'status': 'success', 'message': 'Text received'})
+        elif role == 'client':
+            session_id = data.get('session_id')
+            if session_id in SESSIONS and SESSIONS[session_id]['client'] is None:
+                SESSIONS[session_id]['client'] = websocket
+                host_ws = SESSIONS[session_id]['host']
+                print(f"Client joined session: {session_id}")
+                
+                # Notify the host that the client has connected
+                await host_ws.send(json.dumps({'type': 'client_connected'}))
+                
+                # Start relaying messages from client to host
+                await relay_messages(session_id, websocket, host_ws)
+            else:
+                error_msg = "Session not found or already full."
+                await websocket.send(json.dumps({'type': 'error', 'message': error_msg}))
+                print(f"Client failed to join session {session_id}: {error_msg}")
+                await websocket.close()
 
-@app.route('/get-text/<string:code>', methods=['GET'])
-def get_text(code):
-    """
-    Provides text to the PC client.
-    The PC app will poll this endpoint continuously.
-    """
-    if code not in connections:
-        return jsonify({'status': 'error', 'message': 'Invalid connection code'}), 404
-
-    # Get the text associated with the code
-    text_to_type = connections[code]
-
-    if text_to_type:
-        # Clear the text after sending it so it's not typed again
-        connections[code] = ""
-        print(f"Sent text to PC with code {code}: '{text_to_type}'.")
-        return jsonify({'text': text_to_type})
-    else:
-        # If there's no new text, return an empty string
-        return jsonify({'text': ''})
-
-@app.route('/close-connection/<string:code>', methods=['POST'])
-def close_connection(code):
-    """
-    Allows the PC client to remove its code from the server when it closes.
-    """
-    if code in connections:
-        del connections[code]
-        print(f"Connection closed for code: {code}. Current connections: {connections}")
-        return jsonify({'status': 'success', 'message': 'Connection closed'})
-    return jsonify({'status': 'error', 'message': 'Invalid code'}), 404
+    except websockets.exceptions.ConnectionClosed:
+        print(f"Connection from {websocket.remote_address} closed.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        # --- Cleanup Logic ---
+        # Find which session this websocket belonged to and remove it
+        session_to_remove = None
+        for session_id, participants in SESSIONS.items():
+            if websocket == participants['host'] or websocket == participants['client']:
+                session_to_remove = session_id
+                # Notify the other participant if they are still connected
+                other_ws = participants['client'] if websocket == participants['host'] else participants['host']
+                if other_ws and other_ws.open:
+                    await other_ws.send(json.dumps({'type': 'partner_disconnected'}))
+                break
+        
+        if session_to_remove:
+            del SESSIONS[session_to_remove]
+            print(f"Cleaned up session: {session_to_remove}")
 
 
-if __name__ == '__main__':
-    # Running on 0.0.0.0 makes the server accessible from other devices on the same network.
-    # For AWS, you would configure a security group to allow traffic on port 5000.
-    app.run(host='0.0.0.0', port=5000, debug=True)
+async def main():
+    # Render provides the PORT environment variable.
+    # We'll use 8080 as a default for local testing.
+    port = 8080
+    host = '0.0.0.0' # Listen on all available network interfaces
+    
+    print(f"Starting websocket server on {host}:{port}...")
+    async with websockets.serve(handler, host, port):
+        await asyncio.Future()  # Run forever
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
